@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/logo.png" alt="Nebula" width="420" />
+<img src="docs/assets/logo.png" alt="Nebula" />
 
 # Nebula Systems Installer
 
