@@ -1,0 +1,6 @@
+# Nebula Systems Installer — development dependencies
+# Install:  pip install -r requirements-dev.txt
+
+pytest>=8.0
+ruff>=0.4
+mypy>=1.9
