@@ -1,16 +1,16 @@
-# Nebula Systems Installer — runtime dependencies
+# Nebula Systems Installer - runtime dependencies
 #
-# The installer runs on a stock CPython 3.11+ interpreter and deliberately has
-# NO third-party dependencies: it must work before anything has been installed,
-# including pip packages and virtual environments.
+# The bootstrap runs on Ubuntu's stock Python and supplies a temporary managed
+# interpreter when that Python is older than 3.10. The installer deliberately
+# has NO third-party Python dependencies.
 #
 # Everything it needs comes from the standard library:
 #   argparse, getpass, json, pathlib, secrets, shutil, socket,
-#   sqlite3, subprocess, urllib, venv, grp, pwd
+#   sqlite3, subprocess, urllib, grp, pwd
 #
-# Host tools it shells out to (not installable from here):
-#   git      — fetching component repositories
-#   sudo     — installing systemd units
-#   systemctl / journalctl — service management
-#   docker   — container runtime checks
-#   node, npm — building Nebula Panel
+# Host tools are installed and version-checked automatically:
+#   git      - fetching component repositories
+#   sudo     - installing systemd units
+#   systemctl / journalctl - service management
+#   docker   - container runtime checks
+#   node, npm - building Nebula Panel

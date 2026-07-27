@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- All installer prompts, status messages, and documentation now use formal
+  English and restrained terminal status labels.
+- Interactive validation requests corrected input instead of terminating the
+  installer.
+- Failed interactive installation operations preserve completed work and offer
+  an immediate idempotent retry.
+- Database provisioning now migrates the container access, role policy, and
+  storage tables required by a pristine Core checkout.
+- `nebula doctor` now detects incomplete Core database schemas.
+
+## [2.0.0-alpha.1] - 2026-07-27
+
+### Added
+
+- One-command Ubuntu bootstrap with automatic host dependencies.
+- Explicit developer and production installation profiles.
+- Managed CPython 3.11 and verified current Node.js LTS runtime installation.
+- Production DNS validation, Caddy automatic HTTPS, UFW setup and hardened
+  systemd services.
+- Separate Core and Panel service accounts, production plugin isolation and
+  consistent scheduled backups.
+- Installed `nebula` CLI with status, doctor, repair, update, backup, logs and
+  service-management commands.
+- Automated tests for profiles, secrets, generated units, version compatibility
+  and runtime selection.
+
+### Changed
+
+- Component URLs now point to the `Monolink-systems` repositories.
+- Installation is a single idempotent pipeline instead of separate fetch/setup
+  commands.
+- Core's plugin profile is generated as a git-excluded runtime file instead of
+  changing the tracked upstream configuration.
+- Documentation is consolidated into one task-focused README.
+
 ## [1.0.0-alpha.1]
 
 ### Added
@@ -35,5 +72,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Flask panel support (`nebula-gui` service, `nebula_gui_flask` paths).
 - Legacy `install/.env` discovery and the monorepo-relative path assumptions.
 
-[Unreleased]: https://github.com/elmWilh/NebulaSystemsInstaller/compare/v1.0.0-alpha.1...HEAD
-[1.0.0-alpha.1]: https://github.com/elmWilh/NebulaSystemsInstaller/releases/tag/v1.0.0-alpha.1
+[Unreleased]: https://github.com/Monolink-systems/nebula-systems-installer/compare/v2.0.0-alpha.1...HEAD
+[2.0.0-alpha.1]: https://github.com/Monolink-systems/nebula-systems-installer/compare/v1.0.0-alpha.1...v2.0.0-alpha.1
+[1.0.0-alpha.1]: https://github.com/Monolink-systems/nebula-systems-installer/releases/tag/v1.0.0-alpha.1

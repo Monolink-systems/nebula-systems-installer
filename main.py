@@ -1,507 +1,859 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Monolink Systems
 # Licensed under AGPLv3 (Nebula Open Source Edition, non-corporate)
-"""Nebula Systems Installer.
+"""Nebula's zero-preparation Ubuntu installer and deployment CLI."""
 
-Provisions and manages a Nebula deployment composed of two independent
-repositories: Nebula Core and Nebula Panel. Runs on a stock Python 3.11
-interpreter with no third-party dependencies.
-"""
+from __future__ import annotations
+
 import argparse
 import getpass
+import os
+import re
+import socket
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
-from modules import components, core_api, docker_setup, paths, ui
-from modules import env as env_module
-from modules.core_service import (
-    DEFAULT_CORE_SERVICE,
-    DEFAULT_PANEL_SERVICE,
-    default_core_run_user,
-    default_panel_run_user,
-    install_core_service,
-    install_panel_service,
-    node_binary,
-    service_action,
-    systemd_available,
+from modules import (
+    backups,
+    components,
+    core_api,
+    database,
+    env,
+    prerequisites,
+    proxy,
+    ui,
 )
+from modules.config import (
+    MODE_DEV,
+    MODE_PROD,
+    DeploymentConfig,
+    normalize_domain,
+)
+from modules.core_service import install_cli, install_services, service_action
+from modules.paths import installer_dir
+from modules.runner import CommandError, Runner
 
-VERSION = (paths.installer_dir() / "VERSION").read_text(encoding="utf-8").strip()
-
-DEFAULT_CORE_HOST = "127.0.0.1"
-DEFAULT_CORE_PORT = 8000
-DEFAULT_PANEL_HOST = "0.0.0.0"
-DEFAULT_PANEL_PORT = 3000
-
-
-class Deployment:
-    """Resolved locations of the components this run operates on."""
-
-    def __init__(self, core: str = "", panel: str = ""):
-        self.core = paths.core_dir(core or None)
-        self.panel = paths.panel_dir(panel or None)
-
-    @property
-    def core_ready(self) -> bool:
-        return paths.is_core_dir(self.core)
-
-    @property
-    def panel_ready(self) -> bool:
-        return paths.is_panel_dir(self.panel)
-
-    def describe(self) -> None:
-        print(f" Core  : {self.core if self.core_ready else 'not found'}")
-        print(f" Panel : {self.panel if self.panel_ready else 'not found'}")
-
-    def require_core(self) -> Path:
-        if not self.core_ready:
-            ui.error(
-                "Nebula Core was not found. Pass --core-dir, set NEBULA_CORE_DIR, "
-                "or place the checkout next to this installer."
-            )
-            sys.exit(2)
-        return self.core
-
-    def require_panel(self) -> Path:
-        if not self.panel_ready:
-            ui.error(
-                "Nebula Panel was not found. Pass --panel-dir, set NEBULA_PANEL_DIR, "
-                "or place the checkout next to this installer."
-            )
-            sys.exit(2)
-        return self.panel
+VERSION = (installer_dir() / "VERSION").read_text(encoding="utf-8").strip()
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 
 
-def panel_origins(host: str, port: int) -> str:
-    origins = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
-    if host not in {"0.0.0.0", "127.0.0.1", "localhost", ""}:
-        origins.append(f"http://{host}:{port}")
-    return ",".join(origins)
+def _load_config(args: argparse.Namespace) -> DeploymentConfig:
+    config = DeploymentConfig.load(getattr(args, "state", ""))
+    if not config:
+        raise CommandError("Nebula is not installed yet. Run: ./install.sh")
+    return config
 
 
-def prepare_core(core: Path, core_host: str, core_port: int, origins: str) -> dict[str, str]:
-    ui.step("Preparing the Core virtual environment")
-    ui.result(*components.ensure_core_virtualenv(core))
-
-    ui.step("Installing Core dependencies")
-    ok, message = components.install_core_dependencies(core)
-    if not ok:
-        ui.error(message)
-        sys.exit(1)
-    ui.ok("Core dependencies installed")
-
-    ui.step("Writing the Core environment file")
-    values = env_module.ensure_core_env(
-        core, core_host=core_host, core_port=core_port, panel_origins=origins
-    )
-    ui.ok(f"Environment file ready: {core / '.env'}")
-    return values
-
-
-def prepare_panel(
-    panel: Path,
-    core_values: dict[str, str],
-    core_url: str,
-    panel_host: str,
-    panel_port: int,
-) -> None:
-    ui.step("Writing the Panel environment file")
-    env_module.ensure_panel_env(
-        panel,
-        core_values=core_values,
-        core_url=core_url,
-        panel_host=panel_host,
-        panel_port=panel_port,
-    )
-    ui.ok(f"Environment file ready: {panel / '.env'}")
-
-    node = components.node_version()
-    if not node:
-        ui.warn("Node.js was not found. Skipping the Panel build.")
-        return
-    ui.ok(f"Node.js detected: {node}")
-
-    ui.step("Building the Panel")
-    ok, message = components.build_panel(panel)
-    ui.result(ok, "Panel build completed" if ok else f"Panel build failed: {message}")
-
-
-def ensure_docker() -> None:
-    ui.step("Checking Docker")
-    installed = docker_setup.is_installed()
-    ready, info = docker_setup.daemon_status() if installed else (False, "not installed")
-    if ready:
-        ui.ok("Docker is installed and responding")
-        return
-
-    if not installed:
-        ui.warn("Docker is not installed.")
-        if ui.ask_yes_no("Install Docker automatically now?", default=True):
-            ui.result(*docker_setup.install(paths.installer_dir()))
-
-    ready, info = docker_setup.daemon_status()
-    if ready:
-        ui.ok("Docker is ready")
-        return
-
-    if "permission denied" in info.lower():
-        if ui.ask_yes_no("Add the current user to the docker group?", default=True):
-            ui.result(*docker_setup.add_user_to_group())
-        return
-
-    if ui.ask_yes_no("Start and enable the Docker service now?", default=True):
-        ui.result(*docker_setup.start_daemon())
-        ready, _ = docker_setup.daemon_status()
-
-    if not ready:
-        ui.warn("Docker is still unavailable. Nebula will install, but containers will not run.")
-
-
-def prompt_admin_credentials() -> tuple[str, str]:
+def _prompt_domain(label: str, default: str) -> str:
     while True:
-        username = ui.ask("Admin username", "nebula_admin")
-        if len(username) < 5 or not username.replace("_", "").isalnum():
-            ui.warn("Username must be at least 5 characters: letters, digits, and underscores.")
-            continue
-        break
-
-    while True:
-        password = getpass.getpass("Admin password: ").strip()
-        confirm = getpass.getpass("Repeat password: ").strip()
-        if len(password) < 12:
-            ui.warn("Password must be at least 12 characters.")
-            continue
-        if password != confirm:
-            ui.warn("Passwords do not match.")
-            continue
-        break
-
-    return username, password
+        raw = ui.ask(label, default)
+        try:
+            return normalize_domain(raw)
+        except ValueError as exc:
+            ui.warn(str(exc))
 
 
-def bootstrap_admin(core: Path, core_host: str, core_port: int, token: str) -> None:
-    if core_api.admin_exists(paths.core_database(core)):
-        ui.ok("An administrator already exists. Skipping.")
-        return
+def _read_admin_password(
+    args: argparse.Namespace, mode: str, username: str
+) -> tuple[str, bool]:
+    minimum = 16 if mode == MODE_PROD else 12
 
-    username, password = prompt_admin_credentials()
-    ok, message = core_api.create_admin(core_host, core_port, username, password, token)
-    if not ok:
-        ui.error(message)
-        sys.exit(1)
-    ui.ok(message)
+    def validation_error(password: str) -> str:
+        if len(password) < minimum:
+            return f"Password must contain at least {minimum} characters."
+        if username.lower() in password.lower():
+            return "Password must not contain the administrator username."
+        return ""
 
+    password_file = getattr(args, "admin_password_file", "")
+    if password_file:
+        try:
+            password_path = Path(password_file).expanduser()
+            metadata = password_path.stat()
+            if mode == MODE_PROD and (
+                not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
+            ):
+                raise CommandError(
+                    "Production password file must be a regular file readable "
+                    "only by its owner (chmod 600)."
+                )
+            password = password_path.read_text(encoding="utf-8").rstrip("\r\n")
+            error = validation_error(password)
+            if error:
+                raise CommandError(error)
+            return password, False
+        except (CommandError, OSError) as exc:
+            if not sys.stdin.isatty():
+                raise
+            ui.warn(f"{exc} Enter the password manually.")
+            args.admin_password_file = ""
 
-def install_services(
-    core: Path,
-    panel: Path,
-    core_service: str,
-    panel_service: str,
-    env_mode: str,
-) -> tuple[bool, bool]:
-    if not systemd_available():
-        ui.warn("systemd is not available. Skipping service installation.")
-        return False, False
-
-    ui.step(f"Installing the Core service as user '{default_core_run_user()}'")
-    core_ok, message = install_core_service(core, service_name=core_service, env_mode=env_mode)
-    ui.result(core_ok, message)
-
-    ui.step(f"Installing the Panel service as user '{default_panel_run_user()}'")
-    panel_ok, message = install_panel_service(panel, service_name=panel_service, env_mode=env_mode)
-    ui.result(panel_ok, message)
-
-    return core_ok, panel_ok
-
-
-def full_install(deployment: Deployment, args: argparse.Namespace) -> None:
-    ui.banner(VERSION)
-    print("This wizard provisions Nebula Core and Nebula Panel on a single Linux host.\n")
-    deployment.describe()
-    print()
-
-    core = deployment.require_core()
-    panel = deployment.require_panel()
-
-    origins = panel_origins(args.panel_host, args.panel_port)
-    core_url = f"http://{args.core_host}:{args.core_port}"
-
-    core_values = prepare_core(core, args.core_host, args.core_port, origins)
-    prepare_panel(panel, core_values, core_url, args.panel_host, args.panel_port)
-    ensure_docker()
-
-    core_running = False
-    if ui.ask_yes_no("Install Nebula as systemd services and start them on boot?", default=True):
-        core_ok, panel_ok = install_services(
-            core, panel, args.core_service_name, args.panel_service_name, args.env_mode
-        )
-        if core_ok:
-            ok, message = service_action(args.core_service_name, "restart")
-            ui.result(ok, message or f"Core service started: {args.core_service_name}")
-            core_running = ok
-        if panel_ok:
-            ok, message = service_action(args.panel_service_name, "restart")
-            ui.result(ok, message or f"Panel service started: {args.panel_service_name}")
-
-    if core_running:
-        ui.step("Waiting for Nebula Core to come online")
-        if not core_api.wait_until_ready(args.core_host, args.core_port):
-            ui.error("Nebula Core did not become ready in time. Check its logs.")
-            sys.exit(1)
-        ui.ok("Nebula Core is online")
-        bootstrap_admin(core, args.core_host, args.core_port, core_values["NEBULA_INSTALLER_TOKEN"])
-    else:
-        ui.warn("Core is not running as a service, so the first admin was not created.")
-        print("Start Core, then run:  ./nebulactl.sh create-admin")
-
-    print()
-    ui.rule()
-    ui.ok("Installation complete.")
-    print(f"  Panel : http://{args.panel_host}:{args.panel_port}")
-    print(f"  Core  : {core_url}")
-    print("\nManage the deployment with:")
-    print("  ./nebulactl.sh status | restart | logs")
-
-
-def create_admin_only(deployment: Deployment, args: argparse.Namespace) -> None:
-    ui.banner(VERSION)
-    core = deployment.require_core()
-    token = env_module.read_env_file(core / ".env").get("NEBULA_INSTALLER_TOKEN", "")
-    if not token:
-        ui.error(f"NEBULA_INSTALLER_TOKEN is not set in {core / '.env'}")
-        sys.exit(1)
-
-    if not core_api.wait_until_ready(args.core_host, args.core_port, timeout=10):
-        ui.error("Nebula Core is offline. Start it first.")
-        sys.exit(1)
-
-    bootstrap_admin(core, args.core_host, args.core_port, token)
-
-
-def fetch_components(deployment: Deployment, args: argparse.Namespace) -> None:
-    ui.banner(VERSION)
-    root = paths.deployment_root()
-    ui.step(f"Fetching missing components into {root}")
-
-    if deployment.core_ready:
-        ui.ok(f"Core already present: {deployment.core}")
-    else:
-        ui.result(*components.clone_core(root / "Nebula-Core", args.branch))
-        deployment.core = paths.core_dir()
-
-    if deployment.panel_ready:
-        ui.ok(f"Panel already present: {deployment.panel}")
-    else:
-        ui.result(*components.clone_panel(root / "Nebula-Panel", args.branch))
-        deployment.panel = paths.panel_dir()
-
-
-def show_status(deployment: Deployment, args: argparse.Namespace) -> None:
-    ui.banner(VERSION)
-    print(" Components")
-    ui.rule()
-    deployment.describe()
-
-    print("\n Host")
-    ui.rule()
-    docker_ok, _ = docker_setup.daemon_status()
-    print(f" Docker  : {'ready' if docker_ok else 'unavailable'}")
-    print(f" Node.js : {components.node_version() or 'not found'}")
-    print(f" systemd : {'available' if systemd_available() else 'unavailable'}")
-
-    print("\n Services")
-    ui.rule()
-    for service in (args.core_service_name, args.panel_service_name):
-        active, _ = service_action(service, "status")
-        print(f" {service:<16}: {'active' if active else 'inactive'}")
-
-    if deployment.core_ready:
-        online = core_api.wait_until_ready(args.core_host, args.core_port, timeout=2)
-        admin = core_api.admin_exists(paths.core_database(deployment.core))
-        print("\n Core API")
-        ui.rule()
-        print(f" Endpoint      : http://{args.core_host}:{args.core_port}")
-        print(f" Reachable     : {'yes' if online else 'no'}")
-        print(f" Administrator : {'configured' if admin else 'missing'}")
-
-
-def manage_services_interactive(args: argparse.Namespace) -> None:
-    print("\n=== Service control ===")
-    if not systemd_available():
-        ui.warn("systemd is not available on this host.")
-        return
-
-    target = ui.ask("Target [all/core/panel]", "all").lower()
-    print(" [1] start   [2] stop   [3] restart   [4] status   [5] logs   [0] back")
-    action = {"1": "start", "2": "stop", "3": "restart", "4": "status", "5": "logs"}.get(
-        input("Select >> ").strip()
-    )
-    if not action:
-        return
-
-    for service in resolve_services(target, args):
-        ok, output = service_action(service, action, lines=args.log_lines)
-        print(f"\n--- {service} ---")
-        print(output or ("done" if ok else "failed"))
-
-
-def resolve_services(target: str, args: argparse.Namespace) -> list[str]:
-    if target == "core":
-        return [args.core_service_name]
-    if target == "panel":
-        return [args.panel_service_name]
-    return [args.core_service_name, args.panel_service_name]
-
-
-def run_interactive(deployment: Deployment, args: argparse.Namespace) -> None:
-    while True:
-        ui.banner(VERSION)
-        deployment.describe()
-        ui.rule()
-        print(" [1] Full install (Core + Panel + services)")
-        print(" [2] Fetch missing components from Git")
-        print(" [3] Create the first administrator")
-        print(" [4] Install / start Docker")
-        print(" [5] Install or update systemd services")
-        print(" [6] Manage services")
-        print(" [7] Rebuild the Panel")
-        print(" [8] Show deployment status")
-        print(" [0] Exit")
-        ui.rule()
-
-        choice = input("SELECT >> ").strip()
-        if choice == "1":
-            full_install(deployment, args)
-        elif choice == "2":
-            fetch_components(deployment, args)
-        elif choice == "3":
-            create_admin_only(deployment, args)
-        elif choice == "4":
-            ensure_docker()
-        elif choice == "5":
-            install_services(
-                deployment.require_core(),
-                deployment.require_panel(),
-                args.core_service_name,
-                args.panel_service_name,
-                args.env_mode,
+    environment_password = os.getenv("NEBULA_ADMIN_PASSWORD")
+    if environment_password:
+        error = validation_error(environment_password)
+        if error:
+            if not sys.stdin.isatty():
+                raise CommandError(error)
+            ui.warn(
+                f"NEBULA_ADMIN_PASSWORD is invalid: {error} "
+                "Enter the password manually."
             )
-        elif choice == "6":
-            manage_services_interactive(args)
-        elif choice == "7":
-            ui.result(*components.build_panel(deployment.require_panel()))
-        elif choice == "8":
-            show_status(deployment, args)
-        elif choice == "0":
-            return
         else:
+            return environment_password, False
+
+    if not sys.stdin.isatty():
+        if mode == MODE_DEV:
+            password = f"nebula-dev-{os.urandom(6).hex()}"
+            return password, True
+        else:
+            raise CommandError(
+                "Production admin password is required in non-interactive mode; "
+                "use --admin-password-file"
+            )
+
+    while True:
+        if mode == MODE_DEV:
+            password = getpass.getpass(
+                "Administrator password [Enter to generate a local password]: "
+            ).strip()
+            if not password:
+                return f"nebula-dev-{os.urandom(6).hex()}", True
+        else:
+            password = getpass.getpass(
+                "Administrator password (minimum 16 characters): "
+            ).strip()
+
+        confirm = getpass.getpass("Confirm administrator password: ").strip()
+        if password != confirm:
+            ui.warn("Passwords do not match. Try again.")
             continue
-        ui.pause()
+
+        error = validation_error(password)
+        if error:
+            ui.warn(error)
+            continue
+        return password, False
+
+
+def _admin_credentials(args: argparse.Namespace, mode: str) -> tuple[str, str, bool]:
+    provided = getattr(args, "admin_user", "")
+    if not sys.stdin.isatty():
+        username = provided or "nebula_admin"
+        if not USERNAME_RE.fullmatch(username):
+            raise CommandError(
+                "Administrator username must contain 5-32 letters, digits, or underscores."
+            )
+        password, generated = _read_admin_password(args, mode, username)
+        return username, password, generated
+
+    while True:
+        username = provided or ui.ask("Administrator username", "nebula_admin")
+        provided = ""
+        if USERNAME_RE.fullmatch(username):
+            password, generated = _read_admin_password(args, mode, username)
+            return username, password, generated
+        ui.warn(
+            "Username must contain 5-32 letters, digits, or underscores. Try again."
+        )
+
+
+def _prepare_root(config: DeploymentConfig, runner: Runner) -> None:
+    if config.mode == MODE_PROD:
+        runner.ensure_directory(
+            config.root_path,
+            owner="root",
+            group=config.shared_group,
+            mode=0o755,
+            privileged=True,
+        )
+    else:
+        config.root_path.mkdir(parents=True, exist_ok=True)
+        config.root_path.chmod(0o750)
+
+
+def _provision_components(
+    config: DeploymentConfig,
+    runner: Runner,
+    *,
+    uv_binary: str,
+    branch: str = "",
+    update_sources: bool = True,
+) -> dict[str, str]:
+    if update_sources:
+        ui.step("Downloading Nebula Core and Nebula Panel")
+        for message in components.sync_sources(config, runner, branch=branch):
+            ui.ok(message)
+
+    ok, version_message = components.validate_versions(
+        config.core_path, config.panel_path
+    )
+    if not ok:
+        raise CommandError(version_message)
+    ui.ok(version_message)
+
+    ui.step("Configuring Nebula Core")
+    components.prepare_core(config, runner, uv_binary)
+    core_values = env.configure_environment(config, runner)
+    env.configure_core_profile(config, runner)
+    env.prepare_storage(config, runner)
+    database.ensure_system_database(config, runner)
+    ui.ok("Core runtime, dependencies, profile, and secrets are ready")
+
+    ui.step("Configuring Nebula Panel")
+    components.prepare_panel(config, runner)
+    ui.ok(
+        "Panel dependencies and production bundle are ready"
+        if config.mode == MODE_PROD
+        else "Panel dependencies and Vite development server are ready"
+    )
+    low, moderate, high, critical = components.panel_audit(config, runner)
+    if any((low, moderate, high, critical)):
+        ui.warn(
+            "Upstream Panel dependency audit: "
+            f"{critical} critical, {high} high, {moderate} moderate, {low} low"
+        )
+    if config.mode == MODE_PROD and critical:
+        raise CommandError(
+            "Production installation stopped: Panel has critical runtime dependency advisories"
+        )
+    if not core_values.get("NEBULA_INSTALLER_TOKEN"):
+        raise CommandError("Core installer token was not generated")
+    return core_values
+
+
+def _install_management(config: DeploymentConfig, runner: Runner) -> Path:
+    components.copy_installer(installer_dir(), config, runner)
+    config.installed_version = VERSION
+    config.save(runner)
+    cli = install_cli(config, runner)
+    install_services(config, runner)
+    if config.mode == MODE_PROD:
+        backups.install_backup_timer(config, runner)
+    return cli
+
+
+def _bootstrap_admin(
+    config: DeploymentConfig,
+    args: argparse.Namespace,
+    core_values: dict[str, str],
+) -> tuple[str, str]:
+    token = core_values["NEBULA_INSTALLER_TOKEN"]
+    count = core_api.admin_count(config.core_host, config.core_port, token)
+    if count is not None and count > 0:
+        ui.ok("A super-administrator already exists")
+        return "", ""
+    username, password, generated = _admin_credentials(args, config.mode)
+    ok, message = core_api.create_admin(
+        config.core_host,
+        config.core_port,
+        username,
+        password,
+        token,
+    )
+    if not ok:
+        raise CommandError(f"Core did not create the super-administrator: {message}")
+    ui.ok(message)
+    return username, password if generated else ""
+
+
+def install_command(args: argparse.Namespace) -> int:
+    ui.banner(VERSION)
+    mode = args.mode or (ui.choose_mode() if sys.stdin.isatty() else "")
+    if mode not in {MODE_DEV, MODE_PROD}:
+        raise CommandError("Choose --mode dev or --mode prod")
+    args.mode = mode
+
+    panel_domain = args.panel_domain
+    core_domain = args.core_domain
+    if mode == MODE_PROD:
+        if sys.stdin.isatty():
+            while True:
+                try:
+                    panel_domain = (
+                        normalize_domain(panel_domain)
+                        if panel_domain
+                        else _prompt_domain("Panel domain", "panel.example.com")
+                    )
+                except ValueError as exc:
+                    ui.warn(str(exc))
+                    panel_domain = ""
+                    continue
+                try:
+                    core_domain = (
+                        normalize_domain(core_domain)
+                        if core_domain
+                        else _prompt_domain("Core API domain", "core.example.com")
+                    )
+                except ValueError as exc:
+                    ui.warn(str(exc))
+                    core_domain = ""
+                    continue
+                if panel_domain == core_domain:
+                    ui.warn("Panel and Core must use different domains.")
+                    core_domain = ""
+                    continue
+                break
+        if not panel_domain or not core_domain:
+            raise CommandError("Production requires --panel-domain and --core-domain")
+        args.panel_domain = panel_domain
+        args.core_domain = core_domain
+
+    while True:
+        try:
+            config = DeploymentConfig.create(
+                mode,
+                root=args.root,
+                panel_domain=panel_domain,
+                core_domain=core_domain,
+            )
+            break
+        except ValueError as exc:
+            if not sys.stdin.isatty():
+                raise
+            ui.warn(str(exc))
+            default_root = (
+                "/opt/nebula"
+                if mode == MODE_PROD
+                else str(DeploymentConfig.create(MODE_DEV).root_path)
+            )
+            args.root = ui.ask("Installation directory", default_root)
+    if config.panel_domain and config.panel_domain == config.core_domain:
+        raise CommandError("Panel and Core must use different domains")
+
+    ui.section("Installation plan")
+    print(f"  Mode       : {config.mode}")
+    print(f"  Directory  : {config.root}")
+    print(f"  Panel      : {config.panel_url}")
+    print(f"  Core API   : {config.public_core_url}")
+    print(f"  Services   : {config.core_service}, {config.panel_service}")
+    if not args.yes and sys.stdin.isatty():
+        if not ui.ask_yes_no("Start the installation?", True):
+            ui.info("Installation cancelled by the user.")
+            return 0
+        args.yes = True
+
+    host_issues = prerequisites.verify_host()
+    if host_issues:
+        raise CommandError("\n".join(host_issues))
+
+    runner = Runner(verbose=args.verbose)
+    runner.require_privileges()
+    try:
+        if mode == MODE_PROD:
+            ready, dns_messages = proxy.dns_status(config)
+            ui.step("Checking public DNS")
+            for message in dns_messages:
+                (ui.ok if ready or "->" in message else ui.warn)(message)
+            if not ready:
+                ui.warn(
+                    "TLS will become available after the A/AAAA records resolve "
+                    "to this server and ports 80 and 443 are reachable."
+                )
+
+        ui.step("Preparing Ubuntu and host dependencies")
+        prerequisites.ensure_base_packages(runner, production=mode == MODE_PROD)
+        docker_version = prerequisites.ensure_docker_engine(runner)
+        uv_binary = prerequisites.ensure_uv(runner)
+        node_binary = prerequisites.ensure_node_lts(runner)
+        if mode == MODE_PROD:
+            prerequisites.ensure_caddy(runner)
+        ui.ok(f"uv: {uv_binary}")
+        node_version = subprocess.run(
+            [node_binary, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        ui.ok(f"Node.js: {node_version}")
+        ui.ok(f"Docker: {docker_version}")
+
+        ui.step("Configuring service accounts, Docker, and directories")
+        prerequisites.ensure_service_accounts(config, runner)
+        prerequisites.start_docker(runner)
+        _prepare_root(config, runner)
+        ui.ok("Docker is running and service permissions are configured")
+
+        core_values = _provision_components(
+            config,
+            runner,
+            uv_binary=uv_binary,
+            branch=args.branch,
+        )
+
+        ui.step("Installing system services and the nebula command")
+        cli_path = _install_management(config, runner)
+        ui.ok(f"CLI: {cli_path}")
+        ui.ok("Core and Panel are enabled at boot")
+
+        ui.step("Checking Core and creating the super-administrator")
+        if not core_api.wait_until_ready(
+            config.core_host, config.core_port, timeout=60
+        ):
+            _, logs = service_action(
+                config.core_service, "logs", runner=runner, lines=60
+            )
+            raise CommandError(f"Nebula Core did not become ready in time.\n{logs}")
+        admin_user, generated_password = _bootstrap_admin(config, args, core_values)
+
+        https_ready = False
+        if mode == MODE_PROD:
+            ui.step("Configuring reverse proxy, TLS, and firewall")
+            proxy.install_caddy_config(config, runner)
+            ui.ok("Caddy is managing HTTPS and certificate renewal")
+            ui.ok(prerequisites.configure_firewall(runner, enable=not args.no_firewall))
+            dns_ready, _ = proxy.dns_status(config)
+            if dns_ready:
+                https_ready = proxy.wait_for_https(config.panel_domain, timeout=60)
+                (ui.ok if https_ready else ui.warn)(
+                    "Panel is responding over HTTPS"
+                    if https_ready
+                    else "Caddy is still obtaining the certificate; check: nebula logs proxy"
+                )
+
+        ui.section("Installation complete")
+        ui.ok(f"Nebula is available at {config.panel_url}")
+        print(f"  Core API : {config.public_core_url}")
+        print(f"  CLI      : {cli_path}")
+        print("  Verify   : nebula doctor")
+        print("  Logs     : nebula logs all")
+        if admin_user:
+            print(f"  Admin    : {admin_user}")
+        if generated_password:
+            ui.warn(f"Store this generated password now: {generated_password}")
+        if mode == MODE_DEV and str(cli_path.parent) not in os.getenv("PATH", "").split(
+            ":"
+        ):
+            ui.info(f'Add the CLI to PATH: export PATH="{cli_path.parent}:$PATH"')
+        if mode == MODE_PROD and not https_ready:
+            ui.info(
+                "Caddy will obtain and renew certificates after DNS becomes available."
+            )
+        return 0
+    finally:
+        runner.close()
+
+
+def _service_names(config: DeploymentConfig, target: str) -> list[str]:
+    if target == "core":
+        return [config.core_service]
+    if target == "panel":
+        return [config.panel_service]
+    if target == "proxy":
+        return ["caddy"]
+    services = [config.core_service, config.panel_service]
+    if config.mode == MODE_PROD:
+        services.append("caddy")
+    return services
+
+
+def services_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    runner = Runner(verbose=args.verbose)
+    failed = False
+    for service in _service_names(config, args.target):
+        ok, output = service_action(
+            service,
+            args.command,
+            runner=runner,
+            lines=getattr(args, "lines", 120),
+            follow=getattr(args, "follow", False),
+        )
+        if not getattr(args, "follow", False):
+            print(f"\n--- {service} ---")
+            print(output or ("ok" if ok else "failed"))
+        failed = failed or not ok
+    return 1 if failed else 0
+
+
+def status_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    ui.banner(VERSION)
+    ui.section("Deployment")
+    print(f"  Mode       : {config.mode}")
+    print(f"  Root       : {config.root}")
+    core_version, panel_version = components.component_versions(
+        config.core_path, config.panel_path
+    )
+    print(f"  Core       : {core_version}")
+    print(f"  Panel      : {panel_version}")
+    print(f"  Panel URL  : {config.panel_url}")
+    print(f"  Core URL   : {config.public_core_url}")
+
+    ui.section("Services")
+    healthy = True
+    for service in [config.core_service, config.panel_service]:
+        ok, output = service_action(service, "is-active")
+        state = output.strip() or "unknown"
+        print(f"  {service:<14}: {state}")
+        healthy = healthy and ok
+    if config.mode == MODE_PROD:
+        ok, output = service_action("caddy", "is-active")
+        print(f"  {'caddy':<14}: {output.strip() or 'unknown'}")
+        healthy = healthy and ok
+
+    core_ready = core_api.wait_until_ready(
+        config.core_host, config.core_port, timeout=2
+    )
+    print(f"\n  Core health : {'ok' if core_ready else 'offline'}")
+    return 0 if healthy and core_ready else 1
+
+
+def _check_http(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def doctor_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    ui.banner(VERSION)
+    checks: list[tuple[str, bool, str]] = []
+
+    checks.append(
+        (
+            "Core sources",
+            (config.core_path / "nebula_core/main.py").exists(),
+            str(config.core_path),
+        )
+    )
+    checks.append(
+        (
+            "Panel sources",
+            (config.panel_path / "package.json").exists(),
+            str(config.panel_path),
+        )
+    )
+    compatible, versions = components.validate_versions(
+        config.core_path, config.panel_path
+    )
+    checks.append(("Version compatibility", compatible, versions))
+    checks.append(
+        (
+            "Python runtime",
+            (config.core_path / ".venv/bin/python").exists(),
+            "Core .venv",
+        )
+    )
+    node_version = components.node_version()
+    node_lts = prerequisites.node_lts_name()
+    checks.append(
+        (
+            "Node.js LTS",
+            prerequisites._major(node_version) >= prerequisites.MIN_NODE_MAJOR
+            and bool(node_lts),
+            f"{node_version} ({node_lts})" if node_version else "missing",
+        )
+    )
+    checks.append(("Docker", service_action("docker", "is-active")[0], "systemd"))
+    checks.append(
+        (
+            "Core service",
+            service_action(config.core_service, "is-active")[0],
+            config.core_service,
+        )
+    )
+    checks.append(
+        (
+            "Panel service",
+            service_action(config.panel_service, "is-active")[0],
+            config.panel_service,
+        )
+    )
+    checks.append(
+        (
+            "Core API",
+            core_api.wait_until_ready(config.core_host, config.core_port, timeout=3),
+            config.panel_core_url,
+        )
+    )
+    checks.append(
+        (
+            "Panel port",
+            _check_http(config.panel_host, config.panel_port),
+            f"{config.panel_host}:{config.panel_port}",
+        )
+    )
+    schema_ok, schema_detail = database.schema_status(
+        config.core_path / "storage/databases/system.db"
+    )
+    checks.append(
+        (
+            "Core database schema",
+            schema_ok is not False,
+            schema_detail,
+        )
+    )
+
+    if config.mode == MODE_PROD:
+        core_values = env.read_env_file(config.core_env_path)
+        panel_values = env.read_env_file(config.panel_path / ".env")
+        # A non-root operator cannot read 0600 service files; ownership and mode
+        # still remain useful checks without asking for sudo.
+        readable = bool(core_values and panel_values)
+        token_ok = readable and core_values.get(
+            "NEBULA_INSTALLER_TOKEN"
+        ) == panel_values.get("NEBULA_INSTALLER_TOKEN")
+        checks.append(
+            (
+                "Shared internal token",
+                token_ok or not readable,
+                "matched"
+                if token_ok
+                else "protected; run sudo nebula doctor for deep check",
+            )
+        )
+        checks.append(
+            (
+                "Secure cookies",
+                core_values.get("NEBULA_COOKIE_SECURE") == "true" or not readable,
+                "production policy",
+            )
+        )
+        dns_ready, messages = proxy.dns_status(config)
+        checks.append(("Public DNS", dns_ready, "; ".join(messages[:2])))
+        checks.append(
+            ("Caddy", service_action("caddy", "is-active")[0], "automatic HTTPS")
+        )
+
+    ui.section("Diagnostics")
+    failed = 0
+    for name, ok, detail in checks:
+        if ok:
+            ui.ok(f"{name}: {detail}")
+        else:
+            ui.error(f"{name}: {detail}")
+            failed += 1
+    if failed:
+        ui.warn(f"Detected issues: {failed}. Run: nebula repair")
+    else:
+        ui.ok("The deployment is ready")
+    return 1 if failed else 0
+
+
+def _privileged_reexec(
+    config: DeploymentConfig, args: argparse.Namespace
+) -> int | None:
+    if config.mode != MODE_PROD or os.geteuid() == 0:
+        return None
+    runner = Runner(verbose=args.verbose)
+    runner.require_privileges()
+    command = [
+        "env",
+        f"NEBULA_STATE_FILE={config.state_path}",
+        str(config.core_path / ".venv/bin/python"),
+        str(config.installer_path / "main.py"),
+        args.command,
+    ]
+    if args.command == "backup" and getattr(args, "scheduled", False):
+        command.append("--scheduled")
+    result = runner.sudo(command, capture=False, check=False)
+    return result.returncode
+
+
+def backup_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    reexec = _privileged_reexec(config, args)
+    if reexec is not None:
+        return reexec
+    path = backups.create_backup(
+        config,
+        include_workspaces=not getattr(args, "databases_only", False),
+    )
+    ui.ok(f"Backup created: {path}")
+    return 0
+
+
+def repair_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    runner = Runner(verbose=args.verbose)
+    runner.require_privileges()
+    try:
+        ui.banner(VERSION)
+        ui.step("Checking runtimes and restoring configuration")
+        uv_binary = prerequisites.ensure_uv(runner)
+        prerequisites.ensure_node_lts(runner)
+        prerequisites.ensure_service_accounts(config, runner)
+        prerequisites.start_docker(runner)
+        _prepare_root(config, runner)
+        _provision_components(
+            config,
+            runner,
+            uv_binary=uv_binary,
+            update_sources=False,
+        )
+        _install_management(config, runner)
+        if config.mode == MODE_PROD:
+            prerequisites.ensure_caddy(runner)
+            proxy.install_caddy_config(config, runner)
+        runner.sudo(["systemctl", "restart", config.core_service, config.panel_service])
+        ui.ok("Configuration, build, and services were restored")
+        return 0
+    finally:
+        runner.close()
+
+
+def update_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    runner = Runner(verbose=args.verbose)
+    runner.require_privileges()
+    try:
+        ui.banner(VERSION)
+        if config.mode == MODE_PROD:
+            result = runner.sudo(
+                [
+                    "env",
+                    f"NEBULA_STATE_FILE={config.state_path}",
+                    str(config.core_path / ".venv/bin/python"),
+                    str(config.installer_path / "main.py"),
+                    "backup",
+                    "--databases-only",
+                ],
+                capture=False,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise CommandError("Pre-update backup failed; update was cancelled")
+        uv_binary = prerequisites.ensure_uv(runner)
+        prerequisites.ensure_node_lts(runner)
+        _provision_components(
+            config,
+            runner,
+            uv_binary=uv_binary,
+            branch=args.branch,
+            update_sources=True,
+        )
+        _install_management(config, runner)
+        runner.sudo(["systemctl", "restart", config.core_service, config.panel_service])
+        if not core_api.wait_until_ready(
+            config.core_host, config.core_port, timeout=60
+        ):
+            raise CommandError("Core did not become healthy after the update")
+        ui.ok("Core and Panel updated together and restarted")
+        return 0
+    finally:
+        runner.close()
+
+
+def rotate_secrets_command(args: argparse.Namespace) -> int:
+    config = _load_config(args)
+    runner = Runner(verbose=args.verbose)
+    runner.require_privileges()
+    try:
+        env.configure_environment(config, runner, rotate_secrets=True)
+        runner.sudo(["systemctl", "restart", config.core_service, config.panel_service])
+        ui.ok(
+            "Internal, session and password-reset secrets rotated; all sessions were revoked"
+        )
+        return 0
+    finally:
+        runner.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="nebula-installer",
-        description="Install and manage a Nebula deployment (Core + Panel).",
+        prog="nebula",
+        description="Install and operate Nebula Core + Panel on Ubuntu.",
     )
-    parser.add_argument("--version", action="version", version=f"nebula-installer {VERSION}")
-
-    location = parser.add_argument_group("component locations")
-    location.add_argument("--core-dir", default="", help="path to the Nebula Core checkout")
-    location.add_argument("--panel-dir", default="", help="path to the Nebula Panel checkout")
-
-    network = parser.add_argument_group("network")
-    network.add_argument("--core-host", default=DEFAULT_CORE_HOST)
-    network.add_argument("--core-port", type=int, default=DEFAULT_CORE_PORT)
-    network.add_argument("--panel-host", default=DEFAULT_PANEL_HOST)
-    network.add_argument("--panel-port", type=int, default=DEFAULT_PANEL_PORT)
-
-    services = parser.add_argument_group("services")
-    services.add_argument("--core-service-name", default=DEFAULT_CORE_SERVICE)
-    services.add_argument("--panel-service-name", default=DEFAULT_PANEL_SERVICE)
-    services.add_argument("--env-mode", default="production")
-    services.add_argument("--log-lines", type=int, default=120)
-
-    actions = parser.add_argument_group("actions")
-    actions.add_argument("--install", action="store_true", help="run the full guided install")
-    actions.add_argument("--fetch", action="store_true", help="clone missing components")
-    actions.add_argument("--branch", default="", help="branch to clone with --fetch")
-    actions.add_argument("--create-admin", action="store_true", help="create the first admin")
-    actions.add_argument("--build-panel", action="store_true", help="rebuild the panel bundle")
-    actions.add_argument("--status", action="store_true", help="print deployment status")
-    actions.add_argument("--check", action="store_true", help="exit 0 when the install is complete")
-    actions.add_argument("--install-services", action="store_true", help="install systemd units")
-    actions.add_argument(
-        "--service-action",
-        choices=["start", "stop", "restart", "status", "logs", "enable", "disable"],
-        default="",
+    parser.add_argument(
+        "--version", action="version", version=f"Nebula Installer {VERSION}"
     )
-    actions.add_argument("--service-target", choices=["all", "core", "panel"], default="all")
+    parser.add_argument("--state", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--verbose", action="store_true", help="show host commands")
+    subparsers = parser.add_subparsers(dest="command")
+
+    install = subparsers.add_parser("install", help="guided installation")
+    install.add_argument("--mode", choices=[MODE_DEV, MODE_PROD], default="")
+    install.add_argument("--root", default="")
+    install.add_argument("--panel-domain", default="")
+    install.add_argument("--core-domain", default="")
+    install.add_argument("--admin-user", default="")
+    install.add_argument("--admin-password-file", default="")
+    install.add_argument("--branch", default="")
+    install.add_argument("--yes", "-y", action="store_true")
+    install.add_argument("--no-firewall", action="store_true")
+
+    subparsers.add_parser("status", help="deployment summary")
+    subparsers.add_parser("doctor", help="diagnose installation and compatibility")
+    subparsers.add_parser(
+        "repair", help="idempotently rebuild configuration and services"
+    )
+    update = subparsers.add_parser(
+        "update", help="backup, update Core + Panel, rebuild and restart"
+    )
+    update.add_argument("--branch", default="")
+
+    for command in ("start", "stop", "restart"):
+        service = subparsers.add_parser(command, help=f"{command} services")
+        service.add_argument(
+            "target",
+            nargs="?",
+            choices=["all", "core", "panel", "proxy"],
+            default="all",
+        )
+
+    logs = subparsers.add_parser("logs", help="show service logs")
+    logs.add_argument(
+        "target", nargs="?", choices=["all", "core", "panel", "proxy"], default="all"
+    )
+    logs.add_argument("--lines", type=int, default=120)
+    logs.add_argument("--follow", "-f", action="store_true")
+
+    backup = subparsers.add_parser("backup", help="create a consistent backup")
+    backup.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    backup.add_argument("--databases-only", action="store_true")
+    subparsers.add_parser(
+        "rotate-secrets",
+        help="rotate production secrets and revoke sessions",
+    )
     return parser
 
 
-def check_install(deployment: Deployment) -> int:
-    if not deployment.core_ready or not deployment.panel_ready:
-        return 2
-    if not (deployment.core / ".env").exists():
-        return 2
-    if not paths.core_database(deployment.core).exists():
-        return 2
-    return 0
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    deployment = Deployment(args.core_dir, args.panel_dir)
-
-    if args.check:
-        sys.exit(check_install(deployment))
-
-    if args.fetch:
-        fetch_components(deployment, args)
-        return
-
-    if args.install:
-        full_install(deployment, args)
-        return
-
-    if args.create_admin:
-        create_admin_only(deployment, args)
-        return
-
-    if args.build_panel:
-        ok, message = components.build_panel(deployment.require_panel())
-        ui.result(ok, message)
-        sys.exit(0 if ok else 1)
-
-    if args.install_services:
-        core_ok, panel_ok = install_services(
-            deployment.require_core(),
-            deployment.require_panel(),
-            args.core_service_name,
-            args.panel_service_name,
-            args.env_mode,
-        )
-        sys.exit(0 if core_ok and panel_ok else 1)
-
-    if args.service_action:
-        failed = False
-        for service in resolve_services(args.service_target, args):
-            ok, output = service_action(service, args.service_action, lines=args.log_lines)
-            print(f"--- {service} ---")
-            print(output or ("done" if ok else "failed"))
-            failed = failed or not ok
-        sys.exit(1 if failed else 0)
-
-    if args.status:
-        show_status(deployment, args)
-        return
-
-    if node_binary() is None:
-        ui.warn("Node.js was not found on PATH. The Panel cannot be built or started without it.")
-
-    run_interactive(deployment, args)
+def main() -> int:
+    parser = build_parser()
+    raw = sys.argv[1:]
+    if not raw:
+        raw = ["install"]
+    args = parser.parse_args(raw)
+    while True:
+        try:
+            if args.command == "install":
+                return install_command(args)
+            if args.command == "status":
+                return status_command(args)
+            if args.command == "doctor":
+                return doctor_command(args)
+            if args.command in {"start", "stop", "restart", "logs"}:
+                return services_command(args)
+            if args.command == "backup":
+                return backup_command(args)
+            if args.command == "repair":
+                return repair_command(args)
+            if args.command == "update":
+                return update_command(args)
+            if args.command == "rotate-secrets":
+                return rotate_secrets_command(args)
+            parser.print_help()
+            return 2
+        except (CommandError, OSError, ValueError) as exc:
+            ui.error(str(exc))
+            if args.command == "install" and sys.stdin.isatty():
+                ui.info(
+                    "Completed steps have been preserved and may be run again safely."
+                )
+                if ui.ask_yes_no(
+                    "Retry the installation from the last completed state?", True
+                ):
+                    ui.info("Retrying the installation.")
+                    continue
+                ui.info(
+                    "Installation stopped by the user. Run the same command to resume."
+                )
+            return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
